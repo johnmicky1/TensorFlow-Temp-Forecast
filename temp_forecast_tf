@@ -1,0 +1,219 @@
+# temp_forecast_tf.py
+# Univariate temperature forecasting with TensorFlow/Keras (LSTM)
+
+import os
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from sklearn.metrics import mean_absolute_error
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+
+# ========= USER SETTINGS =========
+CSV_PATH = "sample_temperature_data.csv"  # <-- put your file name here
+TIME_COL_CANDIDATES = ["timestamp", "datetime", "date", "time", "ds"]
+TEMP_COL_CANDIDATES = ["temperature", "temp", "air_temp", "t", "y"]
+
+FREQ = "1h"          # resample cadence; use "30min" or "15min" if needed
+LOOKBACK = 72        # hours of history in each input window
+HORIZON = 1          # predict 1 step ahead (we roll to get 24h later)
+TEST_SPLIT = 0.2     # last 20% for test
+VAL_SPLIT = 0.1      # from the remaining, 10% for validation
+EPOCHS = 20
+BATCH = 64
+SEED = 123
+# =================================
+
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+
+def find_col(cols, candidates):
+    for c in candidates:
+        if c in cols:
+            return c
+    raise ValueError(f"Could not find any of {candidates} in columns: {list(cols)}")
+
+
+def make_windows(series, lookback=72, horizon=1):
+    X, y = [], []
+    L = len(series)
+    end = L - lookback - horizon + 1
+    for i in range(end):
+        X.append(series[i: i + lookback])
+        y.append(series[i + lookback: i + lookback + horizon])
+    X = np.array(X, dtype="float32")
+    y = np.array(y, dtype="float32").squeeze(-1)
+    return X, y
+
+
+def main():
+    # ---- 1) LOAD & CLEAN ----
+    if not Path(CSV_PATH).exists():
+        raise FileNotFoundError(
+            f"CSV not found at {CSV_PATH}. Please set CSV_PATH to your file name."
+        )
+
+    df = pd.read_csv(CSV_PATH)
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    time_col = find_col(df.columns, TIME_COL_CANDIDATES)
+    temp_col = find_col(df.columns, TEMP_COL_CANDIDATES)
+
+    df[time_col] = pd.to_datetime(df[time_col], errors="coerce", utc=False)
+    df = df.dropna(subset=[time_col, temp_col]).sort_values(time_col)
+    df = df.set_index(time_col)
+
+    # Work only with the temperature series as float
+    df = df[[temp_col]].astype(float).rename(columns={temp_col: "temp"})
+
+    # ---- 2) RESAMPLE + ROBUST GAP FILL ----
+    df = df.resample(FREQ).mean()
+
+    # Time-aware interpolation for gaps, then forward/back fill as safety net
+    df["temp"] = (
+        df["temp"]
+        .interpolate(method="time", limit_direction="both")
+        .fillna(method="ffill")
+        .fillna(method="bfill")
+    )
+
+    # guarantee no NaNs remain
+    if df["temp"].isna().any():
+        # final guard: replace any stubborn NaNs with median
+        df["temp"] = df["temp"].fillna(df["temp"].median())
+    assert df["temp"].isna().sum() == 0, "Still have NaNs after filling."
+
+    # ---- 3) CHRONOLOGICAL SPLIT ----
+    n_total = len(df)
+    test_n = int(math.ceil(n_total * TEST_SPLIT))
+    trainval = df.iloc[: n_total - test_n]
+    test = df.iloc[n_total - test_n :]
+
+    val_n = int(math.ceil(len(trainval) * VAL_SPLIT))
+    train = trainval.iloc[: len(trainval) - val_n]
+    val = trainval.iloc[len(trainval) - val_n :]
+
+    print(f"Samples: total={len(df)}, train={len(train)}, val={len(val)}, test={len(test)}")
+
+    # ---- 4) NORMALIZE (fit on train only) ----
+    mean = train["temp"].mean()
+    std = train["temp"].std(ddof=0) + 1e-8
+
+    def norm(x): return (x - mean) / std
+    def denorm(x): return x * std + mean
+
+    train_norm = norm(train["temp"]).values.astype("float32")
+    val_norm = norm(val["temp"]).values.astype("float32")
+    test_norm = norm(test["temp"]).values.astype("float32")
+
+    # ---- 5) WINDOWING ----
+    X_train, y_train = make_windows(train_norm, LOOKBACK, HORIZON)
+    X_val, y_val = make_windows(val_norm, LOOKBACK, HORIZON)
+    X_test, y_test = make_windows(test_norm, LOOKBACK, HORIZON)
+
+    # Reshape for LSTM: (samples, timesteps, features)
+    X_train = X_train[..., np.newaxis]
+    X_val = X_val[..., np.newaxis]
+    X_test = X_test[..., np.newaxis]
+
+    print("Shapes:",
+          X_train.shape, y_train.shape,
+          X_val.shape, y_val.shape,
+          X_test.shape, y_test.shape)
+
+    # ---- 6) NAÏVE BASELINE (last value) ----
+    if len(X_test) == 0:
+        raise RuntimeError("Not enough data to build test windows. Reduce LOOKBACK or adjust splits.")
+    y_test_naive = X_test[:, -1, 0]  # last observed value
+    mae_naive = mean_absolute_error(denorm(y_test), denorm(y_test_naive))
+    print(f"Naïve baseline MAE: {mae_naive:.3f} (same units as temperature)")
+
+    # ---- 7) MODEL ----
+    model = keras.Sequential([
+        layers.Input(shape=(LOOKBACK, 1)),
+        layers.LSTM(64, return_sequences=True),
+        layers.LSTM(32),
+        layers.Dense(16, activation="relu"),
+        layers.Dense(HORIZON)
+    ])
+    model.compile(optimizer=keras.optimizers.Adam(1e-3), loss="mae")
+    model.summary()
+
+    callbacks = [
+        keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True),
+        keras.callbacks.ModelCheckpoint("temp_forecaster.keras", save_best_only=True)
+    ]
+
+    history = model.fit(
+        X_train, y_train,
+        validation_data=(X_val, y_val),
+        epochs=EPOCHS,
+        batch_size=BATCH,
+        verbose=1,
+        callbacks=callbacks
+    )
+
+    # ---- 8) EVALUATION ----
+    y_pred_test = model.predict(X_test, verbose=0).squeeze()
+    test_mae = mean_absolute_error(denorm(y_test), denorm(y_pred_test))
+    test_mape = np.mean(
+        np.abs((denorm(y_test) - denorm(y_pred_test)) / (np.abs(denorm(y_test)) + 1e-8))
+    ) * 100
+
+    print(f"\nTest MAE:  {test_mae:.3f}")
+    print(f"Test MAPE: {test_mape:.2f}%")
+    print(f"(Lower than naïve baseline MAE {mae_naive:.3f} is good)")
+
+    # ---- 9) PLOT (last 7 days of test) ----
+    try:
+        # index aligned with y_test/y_pred_test
+        start = LOOKBACK + HORIZON - 1
+        idx = test.index[start:]
+        true_series = pd.Series(denorm(y_test), index=idx, name="True")
+        pred_series = pd.Series(denorm(y_pred_test), index=idx, name="Predicted")
+
+        # show last 7 days (or all if test is shorter)
+        tail_steps = int((pd.Timedelta("7D") // pd.Timedelta(FREQ)))
+        plt.figure(figsize=(11, 4))
+        true_series.tail(tail_steps).plot(label="True", linewidth=2)
+        pred_series.tail(tail_steps).plot(label="Predicted", alpha=0.85)
+        plt.title("Temperature — last 7 days (test)")
+        plt.ylabel("Temperature")
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    except Exception as e:
+        print("Plot skipped:", e)
+
+    # ---- 10) ROLLING 24H FORECAST FROM LAST POINT ----
+    def forecast_next_k(series_full_norm, k=24, lookback=LOOKBACK):
+        history = list(series_full_norm[-lookback:])
+        preds = []
+        for _ in range(k):
+            x = np.array(history[-lookback:], dtype="float32")[np.newaxis, :, np.newaxis]
+            yhat = model.predict(x, verbose=0)[0, 0]  # horizon=1
+            preds.append(yhat)
+            history.append(yhat)
+        return np.array(preds, dtype="float32")
+
+    full_norm = norm(df["temp"]).values.astype("float32")
+    next_24_norm = forecast_next_k(full_norm, k=24, lookback=LOOKBACK)
+    next_24 = (next_24_norm * std) + mean
+
+    future_index = pd.date_range(df.index[-1] + pd.Timedelta(FREQ), periods=24, freq=FREQ)
+    forecast_df = pd.DataFrame({"forecast_temp": next_24}, index=future_index)
+
+    print("\nNext 24-hour forecast:")
+    print(forecast_df.round(2).head(24))
+
+    out_path = "next_24h_forecast.csv"
+    forecast_df.to_csv(out_path)
+    print(f"\nSaved forecast to {os.path.abspath(out_path)}")
+
+
+if __name__ == "__main__":
+    main()
